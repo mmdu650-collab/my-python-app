@@ -1,0 +1,1389 @@
+import sqlite3
+import logging
+import re
+import os
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from datetime import datetime, timedelta
+
+# ==========================
+# تنظیمات
+# ==========================
+
+API_TOKEN = "8296362457:AAHvChgZ_b_lHx-lsURcFQQB-8BS-YAWmPY"  # توکن ربات خود را اینجا قرار دهید
+ADMIN_ID = 6445107015  # آیدی عددی ادمین
+SUBSCRIPTION_LOCK = True  # قفل عضویت در کانال
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot, storage=MemoryStorage())
+
+# ==========================
+# دیتابیس
+# ==========================
+
+def get_db_connection():
+    try:
+        db = sqlite3.connect("bot.db", check_same_thread=False)
+        db.execute("PRAGMA foreign_keys = ON")
+        return db
+    except sqlite3.Error as e:
+        logger.error(f"خطا در اتصال به دیتابیس: {e}")
+        return None
+
+db = get_db_connection()
+if db is None:
+    logger.error("عدم توانایی در اتصال به دیتابیس. ربات متوقف می‌شود.")
+    exit(1)
+
+cursor = db.cursor()
+
+try:
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        points REAL DEFAULT 0,
+        invites INTEGER DEFAULT 0,
+        invited_by INTEGER DEFAULT 0,
+        joined_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS channels (
+        channel_id TEXT PRIMARY KEY,
+        channel_name TEXT,
+        required INTEGER DEFAULT 1
+    )
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT
+    )
+    """)
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        order_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        order_type TEXT,
+        details TEXT,
+        amount REAL,
+        points_used REAL,
+        status TEXT DEFAULT 'pending',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME,
+        username TEXT,
+        game_id TEXT
+    )
+    """)
+    
+    # اضافه کردن ادمین اصلی به دیتابیس
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id, username, full_name) VALUES (?, ?, ?)", 
+                  (ADMIN_ID, "Admin", "مدیر اصلی"))
+    
+    db.commit()
+    logger.info("جداول دیتابیس با موفقیت ایجاد شدند")
+
+except sqlite3.Error as e:
+    logger.error(f"خطا در ایجاد جداول: {e}")
+
+# نرخ تبدیل امتیاز به ارزهای بازی‌ها
+conversion_rates = {
+    "uc": {
+        48: 60,
+        75: 120,
+        95: 240,
+        120: 360
+    },
+    "cp": {
+        40: 80,
+        65: 160,
+        85: 240,
+        110: 320
+    },
+    "diamonds": {
+        35: 50,
+        60: 100,
+        80: 200,
+        100: 300
+    }
+}
+
+# ==========================
+# استیت‌ها
+# ==========================
+
+class OrderState(StatesGroup):
+    waiting_for_game_id = State()
+    waiting_for_codm_id = State()
+    waiting_for_freefire_id = State()
+
+class AdminState(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_channel = State()
+    waiting_for_admin = State()
+
+# ==========================
+# توابع کمکی
+# ==========================
+
+async def check_subscription_and_notify(user_id, message=None, callback_query=None):
+    """بررسی عضویت کاربر و نمایش پیام در صورت عدم عضویت"""
+    if not SUBSCRIPTION_LOCK:
+        return True
+    
+    channels = get_channels()
+    if not channels:
+        return True
+    
+    for channel_id, channel_name in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                # نمایش پیام عضویت
+                kb = InlineKeyboardMarkup()
+                for ch_id, ch_name in channels:
+                    kb.add(InlineKeyboardButton(f"🔗 {ch_name}", url=f"https://t.me/{ch_id[1:]}"))
+                kb.add(InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_sub"))
+                
+                text = "📢 برای استفاده از ربات، لطفاً در کانال‌های زیر عضو شوید:"
+                
+                if message:
+                    await message.answer(text, reply_markup=kb)
+                elif callback_query:
+                    await callback_query.message.answer(text, reply_markup=kb)
+                
+                return False
+        except Exception as e:
+            logger.error(f"خطا در بررسی عضویت کاربر {user_id} در کانال {channel_id}: {e}")
+    
+    return True
+
+def add_user(user_id, username="", first_name="", last_name="", invited_by=0):
+    try:
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, first_name, last_name, invited_by) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, first_name, last_name, invited_by)
+        )
+        db.commit()
+        logger.info(f"کاربر {user_id} اضافه شد")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در افزودن کاربر {user_id}: {e}")
+        return False
+
+def is_user_exists(user_id):
+    try:
+        cursor.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+        return cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        logger.error(f"خطا در بررسی وجود کاربر {user_id}: {e}")
+        return False
+
+def update_points(user_id, amount):
+    try:
+        cursor.execute("UPDATE users SET points = points + ? WHERE user_id=?", (amount, user_id))
+        db.commit()
+        logger.info(f"امتیاز کاربر {user_id} تغییر کرد: {amount}")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در به روز رسانی امتیاز کاربر {user_id}: {e}")
+        return False
+
+def get_points(user_id):
+    try:
+        cursor.execute("SELECT points FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت امتیاز کاربر {user_id}: {e}")
+        return 0
+
+def update_invites(user_id):
+    try:
+        cursor.execute("UPDATE users SET invites = invites + 1 WHERE user_id=?", (user_id,))
+        db.commit()
+        logger.info(f"تعداد دعوت‌های کاربر {user_id} افزایش یافت")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در به روز رسانی دعوت‌های کاربر {user_id}: {e}")
+        return False
+
+def get_invited_by(user_id):
+    try:
+        cursor.execute("SELECT invited_by FROM users WHERE user_id=?", (user_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 0
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت دعوت کننده کاربر {user_id}: {e}")
+        return 0
+
+def is_admin(user_id):
+    try:
+        cursor.execute("SELECT user_id FROM admins WHERE user_id=?", (user_id,))
+        result = cursor.fetchone()
+        return result is not None
+    except sqlite3.Error as e:
+        logger.error(f"خطا در بررسی ادمین بودن کاربر {user_id}: {e}")
+        return False
+
+def get_channels():
+    try:
+        cursor.execute("SELECT channel_id, channel_name FROM channels WHERE required=1")
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت لیست کانال‌ها: {e}")
+        return []
+
+def add_channel(channel_id, channel_name):
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO channels (channel_id, channel_name) VALUES (?, ?)",
+            (channel_id, channel_name)
+        )
+        db.commit()
+        logger.info(f"کانال {channel_id} افزوده شد")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در افزودن کانال {channel_id}: {e}")
+        return False
+
+def remove_channel(channel_id):
+    try:
+        cursor.execute("DELETE FROM channels WHERE channel_id=?", (channel_id,))
+        db.commit()
+        logger.info(f"کانال {channel_id} حذف شد")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در حذف کانال {channel_id}: {e}")
+        return False
+
+def add_admin(user_id, username="", full_name=""):
+    try:
+        cursor.execute(
+            "INSERT OR REPLACE INTO admins (user_id, username, full_name) VALUES (?, ?, ?)",
+            (user_id, username, full_name)
+        )
+        db.commit()
+        logger.info(f"ادمین {user_id} افزوده شد")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در افزودن ادمین {user_id}: {e}")
+        return False
+
+def remove_admin(user_id):
+    try:
+        cursor.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
+        db.commit()
+        logger.info(f"ادمین {user_id} حذف شد")
+        return True
+    except sqlite3.Error as e:
+        logger.error(f"خطا در حذف ادمین {user_id}: {e}")
+        return False
+
+def get_admins():
+    try:
+        cursor.execute("SELECT user_id, username, full_name FROM admins")
+        return cursor.fetchall()
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت لیست ادمین‌ها: {e}")
+        return []
+
+def main_menu(user_id):
+    kb = ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2
+    )
+    
+    kb.row(
+        KeyboardButton("🎁 دعوت دوستان"), 
+        KeyboardButton("📊 پروفایل")
+    )
+    
+    kb.row(
+        KeyboardButton("🎮 دریافت یوسی رایگان"),
+        KeyboardButton("⚡ دریافت CP کالاف")
+    )
+    
+    kb.row(
+        KeyboardButton("💎 دریافت جم فری فایر"),
+        KeyboardButton("📖 راهنما")
+    )
+    
+    kb.add(KeyboardButton("📞 پشتیبانی"))
+    
+    if is_admin(user_id):
+        kb.add(KeyboardButton("⚙️ ادمین"))
+    
+    return kb
+
+async def check_subscription(user_id):
+    if not SUBSCRIPTION_LOCK:
+        return True
+    
+    channels = get_channels()
+    for channel_id, channel_name in channels:
+        try:
+            member = await bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            if member.status not in ['member', 'administrator', 'creator']:
+                return False
+        except Exception as e:
+            logger.error(f"خطا در بررسی عضویت کاربر {user_id} در کانال {channel_id}: {e}")
+            return False
+    return True
+
+def is_valid_game_id(game_id):
+    return re.match(r'^[a-zA-Z0-9]+$', game_id) is not None
+
+def is_valid_codm_id(game_id):
+    return re.match(r'^[a-zA-Z0-9]+$', game_id) is not None
+
+def is_valid_freefire_id(game_id):
+    return re.match(r'^[a-zA-Z0-9]+$', game_id) is not None
+
+async def notify_inviter(invited_by: int, new_user_id: int, new_user_name: str, new_user_username: str, success: bool):
+    """اطلاع رسانی به کاربر دعوت‌کننده"""
+    try:
+        if success:
+            # دعوت موفق
+            message_text = (
+                f"🎉 کاربر {new_user_name} (@{new_user_username or 'بدون یوزرنیم'}) با لینک دعوت شما عضو ربات شد!\n\n"
+                f"✅ 1 امتیاز به حساب شما اضافه شد."
+            )
+        else:
+            # کاربر قبلاً عضو بوده
+            message_text = (
+                f"ℹ️ کاربر {new_user_name} (@{new_user_username or 'بدون یوزرنیم'}) قبلاً در ربات عضو بوده است.\n\n"
+                f"❌ این کاربر قبلاً عضو بوده، بنابراین امتیازی دریافت نکردید."
+            )
+        
+        await bot.send_message(invited_by, message_text)
+        
+    except Exception as e:
+        logger.error(f"خطا در اطلاع‌رسانی به دعوت‌کننده {invited_by}: {e}")
+
+# ==========================
+# استارت
+# ==========================
+
+@dp.message_handler(commands=["start"])
+async def start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or ""
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    
+    args = message.get_args()
+    invited_by = 0
+    
+    is_new_user = not is_user_exists(user_id)
+    user_name = f"{first_name} {last_name}".strip() or "یک کاربر"
+    
+    if args and args.isdigit():
+        invited_by = int(args)
+        
+        if invited_by != user_id and is_user_exists(invited_by):
+            if is_new_user:
+                # کاربر جدید - ثبت نام و دادن امتیاز
+                add_user(user_id, username, first_name, last_name, invited_by)
+                update_points(user_id, 1)  # امتیاز به کاربر جدید
+                update_points(invited_by, 1)  # امتیاز به دعوت کننده
+                update_invites(invited_by)  # افزایش تعداد دعوت‌ها
+                
+                # اطلاع موفق به دعوت‌کننده
+                await notify_inviter(invited_by, user_id, user_name, username, True)
+                
+                welcome_text = f"""🎉 خوش آمدید {first_name}!
+
+✅ به پاس عضویت از طریق لینک دعوت، 1 امتیاز هدیه دریافت کردید!"""
+            else:
+                # کاربر قدیمی - فقط اطلاع به دعوت کننده
+                welcome_text = "✅ شما قبلاً در ربات عضو شده‌اید!"
+                
+                # اطلاع ناموفق به دعوت‌کننده
+                await notify_inviter(invited_by, user_id, user_name, username, False)
+        else:
+            # لینک دعوت نامعتبر
+            welcome_text = "👋 به ربات خوش آمدید!"
+            if is_new_user:
+                add_user(user_id, username, first_name, last_name)
+    else:
+        # شروع بدون لینک دعوت
+        if is_new_user:
+            add_user(user_id, username, first_name, last_name)
+            welcome_text = "👋 به ربات خوش آمدید!"
+        else:
+            welcome_text = "✅ شما قبلاً در ربات عضو شده‌اید!"
+    
+    if not await check_subscription(user_id):
+        channels = get_channels()
+        kb = InlineKeyboardMarkup()
+        for channel_id, channel_name in channels:
+            kb.add(InlineKeyboardButton(f"🔗 {channel_name}", url=f"https://t.me/{channel_id[1:]}"))
+        kb.add(InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_sub"))
+        
+        await message.answer(
+            "📢 برای استفاده از ربات، لطفاً در کانال‌های زیر عضو شوید:",
+            reply_markup=kb
+        )
+        return
+    
+    await message.answer(
+        f"""{welcome_text}
+
+🎮 در این ربات می‌توانید:
+• با دعوت از دوستان امتیاز کسب کنید
+• امتیازهای خود را به ارزهای بازی‌های مختلف تبدیل کنید
+
+📊 برای شروع از منوی زیر انتخاب کنید:""",
+        reply_markup=main_menu(user_id)
+    )
+
+@dp.callback_query_handler(lambda c: c.data == "check_sub")
+async def check_sub_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if await check_subscription(user_id):
+        await callback_query.message.edit_text(
+            "✅ شما در تمام کانال‌ها عضو هستید. اکنون می‌توانید از ربات استفاده کنید.",
+            reply_markup=None
+        )
+        await callback_query.message.answer("منوی اصلی:", reply_markup=main_menu(user_id))
+    else:
+        await callback_query.answer("❌ هنوز در برخی کانال‌ها عضو نشده‌اید!", show_alert=True)
+
+# ==========================
+# هندلرهای دکمه‌های اصلی با بررسی عضویت
+# ==========================
+
+@dp.message_handler(lambda m: m.text == "📊 پروفایل")
+async def profile(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    try:
+        cursor.execute("SELECT points, invites FROM users WHERE user_id=?", (user_id,))
+        data = cursor.fetchone()
+        
+        if data:
+            cursor.execute("SELECT COUNT(*) FROM orders WHERE user_id=?", (user_id,))
+            order_count = cursor.fetchone()[0]
+            
+            text = f"""
+👤 کاربر: {message.from_user.first_name or 'بی‌نام'}
+⭐ امتیاز: {data[0]}
+👥 تعداد دعوت‌ها: {data[1]}
+📦 تعداد سفارش‌ها: {order_count}
+
+🔗 لینک دعوت شما: https://t.me/{(await bot.get_me()).username}?start={user_id}
+
+هر دعوت موفق = ۱ امتیاز 💰"""
+            await message.answer(text)
+        else:
+            await message.answer("❌ اطلاعات کاربری یافت نشد.")
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت اطلاعات پروفایل کاربر {user_id}: {e}")
+        await message.answer("❌ خطایی در دریافت اطلاعات پروفایل رخ داد.")
+
+@dp.message_handler(lambda m: m.text == "🎁 دعوت دوستان")
+async def invite(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    link = f"https://t.me/{(await bot.get_me()).username}?start={user_id}"
+    
+    # دریافت آمار فعلی کاربر
+    cursor.execute("SELECT invites, points FROM users WHERE user_id=?", (user_id,))
+    user_data = cursor.fetchone()
+    invites_count = user_data[0] if user_data else 0
+    points = user_data[1] if user_data else 0
+    
+    text = f"""
+🎁 سیستم دعوت دوستان
+
+📊 آمار فعلی شما:
+👥 تعداد دعوت‌های موفق: {invites_count}
+⭐ امتیازهای کسب شده از دعوت: {points}
+
+🔗 لینک دعوت شما: 
+{link}
+
+📋 شرایط دعوت:
+✅ هر دعوت موفق = ۱ امتیاز برای شما
+✅ کاربر جدید هم ۱ امتیاز هدیه می‌گیرد
+❌ کاربران قدیمی امتیازی ندارند
+
+💰 امتیازها قابل تبدیل به ارزهای رایگان بازی‌ها هستند!"""
+    
+    await message.answer(text)
+
+@dp.message_handler(lambda m: m.text == "🎮 دریافت یوسی رایگان")
+async def convert_uc(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    points = get_points(user_id)
+    
+    if points < 48:
+        await message.answer("❌ حداقل امتیاز برای دریافت یوسی ۴۸ امتیاز است.")
+        return
+    
+    kb = InlineKeyboardMarkup()
+    for point, uc_amount in conversion_rates["uc"].items():
+        if points >= point:
+            kb.add(InlineKeyboardButton(f"{point} امتیاز → {uc_amount} یوسی", callback_data=f"uc_{point}"))
+    kb.add(InlineKeyboardButton("❌ انصراف", callback_data="cancel"))
+    
+    await message.answer("🎮 انتخاب مقدار یوسی:", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text == "⚡ دریافت CP کالاف")
+async def convert_cp(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    points = get_points(user_id)
+    
+    if points < 40:
+        await message.answer("❌ حداقل امتیاز برای دریافت CP ۴۰ امتیاز است.")
+        return
+    
+    kb = InlineKeyboardMarkup()
+    for point, cp_amount in conversion_rates["cp"].items():
+        if points >= point:
+            kb.add(InlineKeyboardButton(f"{point} امتیاز → {cp_amount} CP", callback_data=f"cp_{point}"))
+    kb.add(InlineKeyboardButton("❌ انصراف", callback_data="cancel"))
+    
+    await message.answer("⚡ انتخاب مقدار CP:", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text == "💎 دریافت جم فری فایر")
+async def convert_diamonds(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    points = get_points(user_id)
+    
+    if points < 35:
+        await message.answer("❌ حداقل امتیاز برای دریافت جم ۳۵ امتیاز است.")
+        return
+    
+    kb = InlineKeyboardMarkup()
+    for point, diamonds_amount in conversion_rates["diamonds"].items():
+        if points >= point:
+            kb.add(InlineKeyboardButton(f"{point} امتیاز → {diamonds_amount} جم", callback_data=f"diamonds_{point}"))
+    kb.add(InlineKeyboardButton("❌ انصراف", callback_data="cancel"))
+    
+    await message.answer("💎 انتخاب مقدار جم:", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text == "📖 راهنما")
+async def help_message(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    help_text = """📖 راهنمای ربات ارز رایگان
+
+🎮 نرخ تبدیل به یوسی (PUBG):
+• ۴۸ امتیاز → ۶۰ یوسی
+• ۷۵ امتیاز → ۱۲۰ یوسی
+• ۹۵ امتیاز → ۲۴۰ یوسی
+• ۱۲۰ امتیاز → ۳۶۰ یوسی
+
+⚡ نرخ تبدیل به CP (Call of Duty Mobile):
+• ۴۰ امتیاز → ۸۰ CP
+• ۶۵ امتیاز → ۱۶۰ CP
+• ۸۵ امتیاز → ۲۴۰ CP
+• ۱۱۰ امتیاز → ۳۲۰ CP
+
+💎 نرخ تبدیل به جم (Free Fire):
+• ۳۵ امتیاز → ۵۰ جم
+• ۶۰ امتیاز → ۱۰۰ جم
+• ۸۰ امتیاز → ۲۰۰ جم
+• ۱۰۰ امتیاز → ۳۰۰ جم
+
+🎁 سیستم دعوت:
+• فقط دعوت‌های موفق = ۱ امتیاز
+• کاربران قدیمی امتیازی ندارند
+• از لینک اختصاصی خود استفاده کنید
+
+📞 پشتیبانی: برای سوالات و مشکلات با پشتیبانی در ارتباط باشید"""
+    
+    await message.answer(help_text)
+
+@dp.message_handler(lambda m: m.text == "📞 پشتیبانی")
+async def support_message(message: types.Message):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    support_text = """📞 پشتیبانی
+
+برای ارتباط با پشتیبانی و دریافت راهنمایی بیشتر، پیام خود را ارسال کنید.
+
+👨‍💻 پاسخگویی 24 ساعته"""
+    
+    await message.answer(support_text)
+
+# ==========================
+# پردازش callback‌ها با بررسی عضویت
+# ==========================
+
+@dp.callback_query_handler(lambda c: c.data.startswith("uc_"))
+async def uc_order(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, callback_query=call):
+        return
+    
+    if call.data == "cancel":
+        await call.message.edit_text("❌ عملیات لغو شد.")
+        return
+    
+    points_used = int(call.data.split("_")[1])
+    uc_amount = conversion_rates["uc"][points_used]
+    
+    current_points = get_points(user_id)
+    
+    if current_points < points_used:
+        await call.answer("❌ امتیاز کافی ندارید!", show_alert=True)
+        return
+    
+    update_points(user_id, -points_used)
+    
+    await state.update_data(points_used=points_used, uc_amount=uc_amount, order_type="uc")
+    await call.message.edit_text(
+        f"🎮 لطفاً آیدی بازی خود در PUBG را ارسال کنید:\n\n"
+        f"📊 مقدار یوسی: {uc_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}"
+    )
+    await OrderState.waiting_for_game_id.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("cp_"))
+async def cp_order(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, callback_query=call):
+        return
+    
+    if call.data == "cancel":
+        await call.message.edit_text("❌ عملیات لغو شد.")
+        return
+    
+    points_used = int(call.data.split("_")[1])
+    cp_amount = conversion_rates["cp"][points_used]
+    
+    current_points = get_points(user_id)
+    
+    if current_points < points_used:
+        await call.answer("❌ امتیاز کافی ندارید!", show_alert=True)
+        return
+    
+    update_points(user_id, -points_used)
+    
+    await state.update_data(points_used=points_used, cp_amount=cp_amount, order_type="cp")
+    await call.message.edit_text(
+        f"⚡ لطفاً آیدی بازی خود در Call of Duty Mobile را ارسال کنید:\n\n"
+        f"📊 مقدار CP: {cp_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}"
+    )
+    await OrderState.waiting_for_codm_id.set()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("diamonds_"))
+async def diamonds_order(call: types.CallbackQuery, state: FSMContext):
+    user_id = call.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, callback_query=call):
+        return
+    
+    if call.data == "cancel":
+        await call.message.edit_text("❌ عملیات لغو شد.")
+        return
+    
+    points_used = int(call.data.split("_")[1])
+    diamonds_amount = conversion_rates["diamonds"][points_used]
+    
+    current_points = get_points(user_id)
+    
+    if current_points < points_used:
+        await call.answer("❌ امتیاز کافی ندارید!", show_alert=True)
+        return
+    
+    update_points(user_id, -points_used)
+    
+    await state.update_data(points_used=points_used, diamonds_amount=diamonds_amount, order_type="diamonds")
+    await call.message.edit_text(
+        f"💎 لطفاً آیدی بازی خود در Free Fire را ارسال کنید:\n\n"
+        f"📊 مقدار جم: {diamonds_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}"
+    )
+    await OrderState.waiting_for_freefire_id.set()
+
+# ==========================
+# پردازش آیدی‌های بازی با بررسی عضویت
+# ==========================
+
+@dp.message_handler(state=OrderState.waiting_for_game_id)
+async def process_game_id(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    game_id = message.text.strip()
+    
+    if not is_valid_game_id(game_id):
+        await message.answer("❌ آیدی بازی نامعتبر است. لطفاً آیدی معتبر وارد کنید:")
+        return
+    
+    data = await state.get_data()
+    points_used = data['points_used']
+    uc_amount = data['uc_amount']
+    
+    try:
+        cursor.execute(
+            "INSERT INTO orders (user_id, order_type, details, amount, points_used, username, game_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, "uc", f"آیدی بازی: {game_id}", uc_amount, points_used, message.from_user.username or "", game_id)
+        )
+        db.commit()
+    except sqlite3.Error as e:
+        logger.error(f"خطا در ذخیره سفارش: {e}")
+    
+    await message.answer(
+        f"✅ سفارش شما ثبت شد!\n\n"
+        f"🎮 مقدار یوسی: {uc_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}\n"
+        f"🆔 آیدی بازی: {game_id}\n\n"
+        f"⏳ یوسی طی ۲۴ ساعت به حساب شما اضافه خواهد شد."
+    )
+    
+    admins = get_admins()
+    for admin_id, admin_username, admin_name in admins:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📦 سفارش جدید!\n\n"
+                f"👤 کاربر: {message.from_user.first_name} (@{message.from_user.username})\n"
+                f"📋 نوع: یوسی رایگان\n"
+                f"🎮 مقدار: {uc_amount} یوسی\n"
+                f"⭐ امتیاز: {points_used}\n"
+                f"🆔 آیدی بازی: {game_id}"
+            )
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به ادمین: {e}")
+    
+    await state.finish()
+
+@dp.message_handler(state=OrderState.waiting_for_codm_id)
+async def process_codm_id(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    game_id = message.text.strip()
+    
+    if not is_valid_codm_id(game_id):
+        await message.answer("❌ آیدی بازی نامعتبر است. لطفاً آیدی معتبر وارد کنید:")
+        return
+    
+    data = await state.get_data()
+    points_used = data['points_used']
+    cp_amount = data['cp_amount']
+    
+    try:
+        cursor.execute(
+            "INSERT INTO orders (user_id, order_type, details, amount, points_used, username, game_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, "cp", f"آیدی بازی: {game_id}", cp_amount, points_used, message.from_user.username or "", game_id)
+        )
+        db.commit()
+    except sqlite3.Error as e:
+        logger.error(f"خطا در ذخیره سفارش: {e}")
+    
+    await message.answer(
+        f"✅ سفارش شما ثبت شد!\n\n"
+        f"⚡ مقدار CP: {cp_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}\n"
+        f"🆔 آیدی بازی: {game_id}\n\n"
+        f"⏳ CP طی ۲۴ ساعت به حساب شما اضافه خواهد شد."
+    )
+    
+    admins = get_admins()
+    for admin_id, admin_username, admin_name in admins:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📦 سفارش جدید!\n\n"
+                f"👤 کاربر: {message.from_user.first_name} (@{message.from_user.username})\n"
+                f"📋 نوع: CP کالاف\n"
+                f"⚡ مقدار: {cp_amount} CP\n"
+                f"⭐ امتیاز: {points_used}\n"
+                f"🆔 آیدی بازی: {game_id}"
+            )
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به ادمین: {e}")
+    
+    await state.finish()
+
+@dp.message_handler(state=OrderState.waiting_for_freefire_id)
+async def process_freefire_id(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    
+    # بررسی عضویت
+    if not await check_subscription_and_notify(user_id, message=message):
+        return
+    
+    game_id = message.text.strip()
+    
+    if not is_valid_freefire_id(game_id):
+        await message.answer("❌ آیدی بازی نامعتبر است. لطفاً آیدی معتبر وارد کنید:")
+        return
+    
+    data = await state.get_data()
+    points_used = data['points_used']
+    diamonds_amount = data['diamonds_amount']
+    
+    try:
+        cursor.execute(
+            "INSERT INTO orders (user_id, order_type, details, amount, points_used, username, game_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, "diamonds", f"آیدی بازی: {game_id}", diamonds_amount, points_used, message.from_user.username or "", game_id)
+        )
+        db.commit()
+    except sqlite3.Error as e:
+        logger.error(f"خطا در ذخیره سفارش: {e}")
+    
+    await message.answer(
+        f"✅ سفارش شما ثبت شد!\n\n"
+        f"💎 مقدار جم: {diamonds_amount}\n"
+        f"⭐ امتیاز مصرفی: {points_used}\n"
+        f"🆔 آیدی بازی: {game_id}\n\n"
+        f"⏳ جم طی ۲۴ ساعت به حساب شما اضافه خواهد شد."
+    )
+    
+    admins = get_admins()
+    for admin_id, admin_username, admin_name in admins:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"📦 سفارش جدید!\n\n"
+                f"👤 کاربر: {message.from_user.first_name} (@{message.from_user.username})\n"
+                f"📋 نوع: جم فری فایر\n"
+                f"💎 مقدار: {diamonds_amount} جم\n"
+                f"⭐ امتیاز: {points_used}\n"
+                f"🆔 آیدی بازی: {game_id}"
+            )
+        except Exception as e:
+            logger.error(f"خطا در ارسال پیام به ادمین: {e}")
+    
+    await state.finish()
+
+# ==========================
+# پنل ادمین
+# ==========================
+
+@dp.message_handler(lambda m: m.text == "⚙️ ادمین")
+async def admin_panel(message: types.Message):
+    user_id = message.from_user.id
+    
+    if not is_admin(user_id):
+        await message.answer("❌ شما دسترسی به این بخش را ندارید.")
+        return
+    
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.row(
+        KeyboardButton("📦 سفارش‌ها"), 
+        KeyboardButton("👥 کاربران")
+    )
+    kb.row(
+        KeyboardButton("📊 آمار ربات"), 
+        KeyboardButton("📢 ارسال به همه")
+    )
+    kb.row(
+        KeyboardButton("🛠️ مدیریت کانال‌ها"), 
+        KeyboardButton("👑 مدیریت ادمین‌ها")
+    )
+    kb.add(KeyboardButton("🔙 برگشت"))
+    
+    await message.answer("👨‍💻 پنل مدیریت ادمین", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text == "🔙 برگشت")
+async def back_menu(message: types.Message):
+    await message.answer("منوی اصلی:", reply_markup=main_menu(message.from_user.id))
+
+@dp.message_handler(lambda m: m.text == "📦 سفارش‌ها")
+async def orders_list(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        cursor.execute("""
+            SELECT order_id, user_id, order_type, details, amount, points_used, status, created_at, completed_at, username, game_id 
+            FROM orders ORDER BY created_at DESC LIMIT 10
+        """)
+        orders = cursor.fetchall()
+        
+        if not orders:
+            await message.answer("📭 هیچ سفارشی وجود ندارد.")
+            return
+        
+        for order in orders:
+            if order[2] == "uc":
+                order_type = "🎮 یوسی رایگان"
+            elif order[2] == "cp":
+                order_type = "⚡ CP کالاف"
+            elif order[2] == "diamonds":
+                order_type = "💎 جم فری فایر"
+            else:
+                order_type = f"📋 {order[2]}"
+                
+            status_emoji = "✅" if order[6] == "completed" else "⏳" if order[6] == "pending" else "❌"
+            
+            kb = InlineKeyboardMarkup()
+            if order[6] == "pending":
+                kb.add(InlineKeyboardButton("✅ تکمیل سفارش", callback_data=f"complete_{order[0]}"))
+            kb.add(InlineKeyboardButton("❌ حذف سفارش", callback_data=f"delete_{order[0]}"))
+            
+            text = f"""
+📦 سفارش #{order[0]}
+👤 کاربر: {order[1]} ({order[9] or 'بدون یوزرنیم'})
+📋 نوع: {order_type}
+🔍 جزئیات: {order[3]}
+💰 مقدار: {order[4]} {order[2].upper() if order[2] != 'diamonds' else 'جم'}
+⭐ امتیاز مصرفی: {order[5]}
+🆔 آیدی بازی: {order[10]}
+📅 تاریخ: {order[7]}
+🔄 وضعیت: {status_emoji} {order[6]}"""
+            await message.answer(text, reply_markup=kb)
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت لیست سفارشات: {e}")
+        await message.answer("❌ خطایی در دریافت لیست سفارشات رخ داد.")
+
+@dp.message_handler(lambda m: m.text == "👥 کاربران")
+async def users_list(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        cursor.execute("SELECT COUNT(*) FROM users")
+        total_users = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM users WHERE DATE(joined_at) = DATE('now')")
+        today_users = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT SUM(points) FROM users")
+        total_points = cursor.fetchone()[0] or 0
+        
+        cursor.execute("SELECT SUM(invites) FROM users")
+        total_invites = cursor.fetchone()[0] or 0
+        
+        text = f"""
+📊 آمار کاربران
+
+👤 کل کاربران: {total_users}
+📈 کاربران امروز: {today_users}
+⭐ کل امتیازها: {total_points}
+🎁 کل دعوت‌ها: {total_invites}"""
+        
+        await message.answer(text)
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت آمار کاربران: {e}")
+        await message.answer("❌ خطایی در دریافت آمار کاربران رخ داد.")
+
+@dp.message_handler(lambda m: m.text == "📊 آمار ربات")
+async def bot_stats(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        cursor.execute("SELECT COUNT(*) FROM orders")
+        total_orders = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE status = 'completed'")
+        completed_orders = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT COUNT(*) FROM orders WHERE status = 'pending'")
+        pending_orders = cursor.fetchone()[0]
+        
+        cursor.execute("SELECT SUM(amount) FROM orders WHERE status = 'completed'")
+        total_amount = cursor.fetchone()[0] or 0
+        
+        text = f"""
+📈 آمار کلی ربات
+
+📦 کل سفارشات: {total_orders}
+✅ سفارشات تکمیل شده: {completed_orders}
+⏳ سفارشات در انتظار: {pending_orders}
+💰 کل ارز پرداختی: {total_amount}"""
+        
+        await message.answer(text)
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دریافت آمار ربات: {e}")
+        await message.answer("❌ خطایی در دریافت آمار ربات رخ داد.")
+
+@dp.message_handler(lambda m: m.text == "📢 ارسال به همه")
+async def broadcast_message(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    await message.answer("📢 لطفاً پیام خود را برای ارسال به همه کاربران ارسال کنید:")
+    await AdminState.waiting_for_broadcast.set()
+
+@dp.message_handler(state=AdminState.waiting_for_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.finish()
+        return
+    
+    try:
+        cursor.execute("SELECT user_id FROM users")
+        users = cursor.fetchall()
+        
+        success = 0
+        failed = 0
+        
+        for (user_id,) in users:
+            try:
+                await bot.copy_message(user_id, message.from_user.id, message.message_id)
+                success += 1
+            except Exception as e:
+                failed += 1
+        
+        await message.answer(f"""
+✅ ارسال همگانی انجام شد
+
+✅ موفق: {success}
+❌ ناموفق: {failed}
+        """)
+        
+    except sqlite3.Error as e:
+        logger.error(f"خطا در ارسال همگانی: {e}")
+        await message.answer("❌ خطایی در ارسال همگانی رخ داد.")
+    
+    await state.finish()
+
+@dp.message_handler(lambda m: m.text == "🛠️ مدیریت کانال‌ها")
+async def manage_channels(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ افزودن کانال", callback_data="add_channel"))
+    kb.add(InlineKeyboardButton("📋 لیست کانال‌ها", callback_data="list_channels"))
+    kb.add(InlineKeyboardButton("🔓 قفل عضویت", callback_data="toggle_sub_lock"))
+    
+    status = "فعال" if SUBSCRIPTION_LOCK else "غیرفعال"
+    await message.answer(f"🛠️ مدیریت کانال‌ها\n\n🔒 قفل عضویت: {status}", reply_markup=kb)
+
+@dp.message_handler(lambda m: m.text == "👑 مدیریت ادمین‌ها")
+async def manage_admins(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("➕ افزودن ادمین", callback_data="add_admin"))
+    kb.add(InlineKeyboardButton("📋 لیست ادمین‌ها", callback_data="list_admins"))
+    
+    await message.answer("👑 مدیریت ادمین‌ها", reply_markup=kb)
+
+# ==========================
+# مدیریت callback queries
+# ==========================
+
+@dp.callback_query_handler(lambda c: c.data == "cancel")
+async def cancel_callback(callback_query: types.CallbackQuery, state: FSMContext):
+    await callback_query.message.edit_text("❌ عملیات لغو شد.")
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("complete_"))
+async def complete_order(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    order_id = int(call.data.split("_")[1])
+    
+    try:
+        cursor.execute(
+            "UPDATE orders SET status = 'completed', completed_at = CURRENT_TIMESTAMP WHERE order_id = ?",
+            (order_id,)
+        )
+        db.commit()
+        
+        await call.message.edit_text(f"✅ سفارش #{order_id} با موفقیت تکمیل شد.")
+        
+        cursor.execute("SELECT user_id FROM orders WHERE order_id = ?", (order_id,))
+        user_id = cursor.fetchone()[0]
+        
+        try:
+            await bot.send_message(user_id, f"✅ سفارش شما #{order_id} با موفقیت تکمیل شد. ارز به حساب بازی شما اضافه گردید.")
+        except Exception as e:
+            logger.error(f"خطا در اطلاع به کاربر: {e}")
+            
+    except sqlite3.Error as e:
+        logger.error(f"خطا در تکمیل سفارش: {e}")
+        await call.answer("❌ خطایی در تکمیل سفارش رخ داد.", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_"))
+async def delete_order(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    order_id = int(call.data.split("_")[1])
+    
+    try:
+        cursor.execute("SELECT user_id, points_used FROM orders WHERE order_id = ?", (order_id,))
+        order_data = cursor.fetchone()
+        if order_data:
+            user_id, points_used = order_data
+            update_points(user_id, points_used)
+        
+        cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+        db.commit()
+        
+        await call.message.edit_text(f"✅ سفارش #{order_id} با موفقیت حذف شد و امتیاز به کاربر بازگردانده شد.")
+    except sqlite3.Error as e:
+        logger.error(f"خطا در حذف سفارش: {e}")
+        await call.answer("❌ خطایی در حذف سفارش رخ داد.", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data == "add_channel")
+async def add_channel_callback(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    await call.message.answer("📢 لطفاً آیدی کانال را به صورت @channel_name ارسال کنید:")
+    await AdminState.waiting_for_channel.set()
+
+@dp.message_handler(state=AdminState.waiting_for_channel)
+async def process_channel(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.finish()
+        return
+    
+    channel_id = message.text.strip()
+    
+    if not channel_id.startswith('@'):
+        await message.answer("❌ آیدی کانال باید با @ شروع شود. لطفاً مجدداً ارسال کنید:")
+        return
+    
+    try:
+        chat = await bot.get_chat(channel_id)
+        channel_name = chat.title
+        
+        if add_channel(channel_id, channel_name):
+            await message.answer(f"✅ کانال {channel_name} ({channel_id}) با موفقیت افزوده شد.")
+        else:
+            await message.answer("❌ خطایی در افزودن کانال رخ داد.")
+    except Exception as e:
+        await message.answer("❌ کانال یافت نشد یا ربات به کانال دسترسی ندارد.")
+    
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data == "list_channels")
+async def list_channels_callback(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    channels = get_channels()
+    
+    if not channels:
+        await call.message.answer("📭 هیچ کانالی ثبت نشده است.")
+        return
+    
+    text = "📋 لیست کانال‌ها:\n\n"
+    kb = InlineKeyboardMarkup()
+    
+    for channel_id, channel_name in channels:
+        text += f"🔗 {channel_name} ({channel_id})\n"
+        kb.add(InlineKeyboardButton(f"❌ حذف {channel_name}", callback_data=f"remove_channel_{channel_id}"))
+    
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("remove_channel_"))
+async def remove_channel_callback(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    channel_id = call.data.replace("remove_channel_", "")
+    
+    if remove_channel(channel_id):
+        await call.message.edit_text(f"✅ کانال {channel_id} با موفقیت حذف شد.")
+    else:
+        await call.answer("❌ خطایی در حذف کانال رخ داد.", show_alert=True)
+
+@dp.callback_query_handler(lambda c: c.data == "toggle_sub_lock")
+async def toggle_sub_lock_callback(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    global SUBSCRIPTION_LOCK
+    SUBSCRIPTION_LOCK = not SUBSCRIPTION_LOCK
+    
+    status = "فعال" if SUBSCRIPTION_LOCK else "غیرفعال"
+    await call.answer(f"🔒 قفل عضویت {status} شد", show_alert=True)
+    await call.message.edit_text(f"🛠️ مدیریت کانال‌ها\n\n🔒 قفل عضویت: {status}")
+
+@dp.callback_query_handler(lambda c: c.data == "add_admin")
+async def add_admin_callback(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    await call.message.answer("👑 لطفاً آیدی عددی کاربر را برای افزودن به ادمین‌ها ارسال کنید:")
+    await AdminState.waiting_for_admin.set()
+
+@dp.message_handler(state=AdminState.waiting_for_admin)
+async def process_admin(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await state.finish()
+        return
+    
+    try:
+        user_id = int(message.text.strip())
+        
+        if not is_user_exists(user_id):
+            await message.answer("❌ کاربر یافت نشد. لطفاً آیدی معتبر ارسال کنید:")
+            return
+        
+        try:
+            user = await bot.get_chat(user_id)
+            username = user.username or ""
+            full_name = f"{user.first_name or ''} {user.last_name or ''}".strip()
+            
+            if add_admin(user_id, username, full_name):
+                await message.answer(f"✅ کاربر {full_name} (@{username}) با موفقیت به ادمین‌ها افزوده شد.")
+                
+                try:
+                    await bot.send_message(user_id, "🎉 شما به عنوان ادمین ربات منصوب شدید!")
+                except Exception as e:
+                    logger.error(f"خطا در اطلاع به کاربر: {e}")
+            else:
+                await message.answer("❌ خطایی در افزودن ادمین رخ داد.")
+        except Exception as e:
+            await message.answer("❌ کاربر یافت نشد. لطفاً آیدی معتبر ارسال کنید:")
+            return
+        
+    except ValueError:
+        await message.answer("❌ آیدی باید عددی باشد. لطفاً مجدداً ارسال کنید:")
+        return
+    
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data == "list_admins")
+async def list_admins_callback(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    admins = get_admins()
+    
+    if not admins:
+        await call.message.answer("📭 هیچ ادمینی ثبت نشده است.")
+        return
+    
+    text = "👑 لیست ادمین‌ها:\n\n"
+    kb = InlineKeyboardMarkup()
+    
+    for user_id, username, full_name in admins:
+        text += f"👤 {full_name} (@{username}) - {user_id}\n"
+        kb.add(InlineKeyboardButton(f"❌ حذف {full_name}", callback_data=f"remove_admin_{user_id}"))
+    
+    await call.message.answer(text, reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data.startswith("remove_admin_"))
+async def remove_admin_callback(call: types.CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("❌ شما دسترسی لازم را ندارید.", show_alert=True)
+        return
+    
+    user_id = int(call.data.replace("remove_admin_", ""))
+    
+    if remove_admin(user_id):
+        await call.message.edit_text(f"✅ ادمین {user_id} با موفقیت حذف شد.")
+        
+        try:
+            await bot.send_message(user_id, "ℹ️ دسترسی ادمین شما از ربات حذف شد.")
+        except Exception as e:
+            logger.error(f"خطا در اطلاع به کاربر: {e}")
+    else:
+        await call.answer("❌ خطایی در حذف ادمین رخ داد.", show_alert=True)
+
+# ==========================
+# مدیریت پیام‌های متنی
+# ==========================
+
+@dp.message_handler()
+async def handle_messages(message: types.Message):
+    user_id = message.from_user.id
+    logger.info(f"پیام دریافت شده از کاربر {user_id}: {message.text}")
+    
+    if message.chat.type == 'private':
+        # بررسی عضویت برای تمام پیام‌ها
+        if not await check_subscription_and_notify(user_id, message=message):
+            return
+            
+        await message.answer("🤖 برای استفاده از ربات، از منوی زیر انتخاب کنید:", reply_markup=main_menu(user_id))
+
+# ==========================
+# مدیریت خطاها
+# ==========================
+
+@dp.errors_handler()
+async def errors_handler(update: types.Update, exception: Exception):
+    logger.error(f"خطا در پردازش به روز رسانی: {exception}")
+    return True
+
+# ==========================
+# اجرا
+# ==========================
+
+if __name__ == "__main__":
+    print("🤖 ربات در حال راه‌اندازی...")
+    try:
+        executor.start_polling(dp, skip_updates=True)
+    except Exception as e:
+        logger.error(f"خطای جدی در اجرای ربات: {e}")
