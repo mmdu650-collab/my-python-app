@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 # تنظیمات
 # ==========================
 
+
 API_TOKEN = "8296362457:AAHvChgZ_b_lHx-lsURcFQQB-8BS-YAWmPY"  # توکن ربات خود را اینجا قرار دهید
 ADMIN_ID = 6445107015  # آیدی عددی ادمین
 SUBSCRIPTION_LOCK = True  # قفل عضویت در کانال
